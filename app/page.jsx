@@ -5,16 +5,21 @@ import React, { useMemo, useState, useEffect, useRef } from "react";
 /**
  * Packaging Box Designer (single-file JSX, WebGL‑safe + dynamic imports)
  *
- * This update wires pricing to the **YunExpress sheet you shared** (CNY):
- * - Line types: **No Battery** vs **Built-in Battery**
- * - Weight brackets with **fee per kg** + **item fee per parcel**
- * - Min. billed weight = 0.03 kg, rounding step = 0.001 kg (carry-over)
- * - Country selector (currently USA table inline)
- * - Pricing mode: **Sheet (US)** or **Manual per-kg** (fallback)
- * - Breakdown shown (fee × billedWeight + item)
+ * This version shows BOTH shipping options:
+ *  - Volumetric basis (dimensional weight)
+ *  - Actual basis (scale weight)
+ * And keeps totals on CHARGEABLE = max(volumetric, actual).
+ *
+ * Pricing is wired to the YunExpress US sheet (CNY):
+ * - Line types: No Battery vs Built-in Battery
+ * - Weight brackets: fee per kg + item fee per parcel
+ * - Min. billed weight = 0.03 kg, rounding step = 0.001 kg
+ * - Country selector (USA inline)
+ * - Pricing mode: Sheet (US) or Manual per-kg (fallback)
+ * - Breakdown shown for each basis
  * - Download: JSON (current), CSV (saved), PNG/SVG (preview)
  *
- * NOTE: Extend the inline table below if you have more countries/lanes.
+ * NOTE: Extend the inline table to add more countries/lanes if needed.
  */
 
 // -----------------------------
@@ -277,6 +282,11 @@ function chargeableToKg(units, chargeable) {
   return normalizeUnits(units) === 'cm' ? chargeable : lbToKg(chargeable);
 }
 
+function toKg(units, value) {
+  const v = Math.max(0, Number(value) || 0);
+  return normalizeUnits(units) === 'cm' ? v : lbToKg(v);
+}
+
 function roundUp(value, step) {
   const s = Math.max(1e-6, step || 0.001);
   return Math.ceil(value / s) * s;
@@ -416,31 +426,50 @@ export default function PackagingBoxDesigner() {
     boardMM: parsed.boardMM, divisor: divisorNumeric, actualWeight: parsed.actualW,
   });
 
-  // Shipping (CNY + USD), based on mode
-  const chargeableKg = chargeableToKg(units, calc.chargeable);
-  const sheetRes = pricingMode === 'sheet' ? computeSheetCNY({ weightKg: chargeableKg, battery, country, table: YUNEXPRESS_US_TABLE }) : null;
-  const manualRes = pricingMode === 'manual' ? computeManualCNY({ weightKg: chargeableKg, rates }) : null;
-  const useRes = sheetRes || manualRes || { totalCNY: 0, usedKg: 0, bracket: null };
+  // Shipping (CNY + USD): compare volumetric vs actual vs chargeable = max
+  const volKg = toKg(units, calc.volWeight);
+  const actualKg = toKg(units, parsed.actualW);
+  const chargeableKg = toKg(units, calc.chargeable);
 
-  const shippingCNY = useRes.totalCNY;
+  const NULL_RES = { totalCNY: 0, usedKg: 0, bracket: null };
+  const computeFor = (kg) => (
+    pricingMode === 'sheet'
+      ? (computeSheetCNY({ weightKg: kg, battery, country, table: YUNEXPRESS_US_TABLE }) || NULL_RES)
+      : computeManualCNY({ weightKg: kg, rates })
+  );
+
+  const resVol = computeFor(volKg);
+  const resActual = actualKg > 0 ? computeFor(actualKg) : NULL_RES;
+  const resCharge = computeFor(chargeableKg);
+
+  const shippingCNY = resCharge.totalCNY;
   const shippingUSD = cnyToUsd(shippingCNY, rates.cnyPerUSD);
   const shippingPerUnitUSD = parsed.qty > 0 ? shippingUSD / parsed.qty : 0;
+
+  const volShippingUSD = cnyToUsd(resVol.totalCNY, rates.cnyPerUSD);
+  const actualShippingUSD = cnyToUsd(resActual.totalCNY, rates.cnyPerUSD);
+  const hasActual = actualKg > 0;
 
   const variableFeeUSD = (Number(priceUSD)||0) * (Number(variableFeePct)||0) / 100;
   const refundFeeUSD = (Number(priceUSD)||0) * (Number(refundFeePct)||0) / 100;
   const costPerUnitUSD = (Number(productCostUSD)||0) + variableFeeUSD + refundFeeUSD + shippingPerUnitUSD;
   const totalCostUSD = costPerUnitUSD * parsed.qty;
 
-  const breakdown = useMemo(() => {
-    if (pricingMode === 'sheet' && sheetRes && sheetRes.bracket) {
-      const b = sheetRes.bracket;
-      return `Sheet(${country}, ${battery ? 'Battery' : 'No Battery'}): fee ${b.feePerKg}×${sheetRes.usedKg.toFixed(3)} + item ${b.itemFee} = ${sheetRes.totalCNY.toFixed(2)} CNY`;
+  function makeBreakdown(res) {
+    if (!res) return '';
+    if (pricingMode === 'sheet' && res.bracket) {
+      const b = res.bracket;
+      return `Sheet(${country}, ${battery ? 'Battery' : 'No Battery'}): fee ${b.feePerKg}×${res.usedKg.toFixed(3)} + item ${b.itemFee} = ${res.totalCNY.toFixed(2)} CNY`;
     }
     if (pricingMode === 'manual') {
-      return `Manual: perKg ${rates.perKgCNY} × ceil(${chargeableKg.toFixed(3)}) = ${Math.ceil(chargeableKg)} kg → ${shippingCNY.toFixed(2)} CNY`;
+      return `Manual: perKg ${rates.perKgCNY} × ${res.usedKg} kg = ${res.totalCNY.toFixed(2)} CNY`;
     }
     return '';
-  }, [pricingMode, sheetRes, manualRes, rates.perKgCNY, country, battery, chargeableKg, shippingCNY]);
+  }
+
+  const breakdownCharge = useMemo(() => makeBreakdown(resCharge), [pricingMode, resCharge, country, battery, rates.perKgCNY]);
+  const breakdownVol = useMemo(() => makeBreakdown(resVol), [pricingMode, resVol, country, battery, rates.perKgCNY]);
+  const breakdownActual = useMemo(() => hasActual ? makeBreakdown(resActual) : '', [pricingMode, resActual, hasActual, country, battery, rates.perKgCNY]);
 
   const crossProfiles = useMemo(() => {
     const list = getDivisorListFor(units);
@@ -485,7 +514,7 @@ export default function PackagingBoxDesigner() {
         volWeight: calc.volWeight, chargeable: calc.chargeable, chargeableKg,
         shippingCNY, shippingUSD,
         shippingPerUnitUSD, costPerUnitUSD, totalCostUSD,
-        breakdown,
+        breakdown: breakdownCharge, // store chargeable basis breakdown for CSV/back-compat
       }
     };
   }
@@ -688,7 +717,38 @@ export default function PackagingBoxDesigner() {
                   </div>
                   <div className="text-xs text-slate-600">{pricingMode === 'sheet' ? 'Sheet pricing' : 'Manual'} · {country} · Battery: <span className="font-medium">{battery ? 'Built-in' : 'No'}</span> · FX: {rates.cnyPerUSD} CNY/USD</div>
                 </div>
-                {breakdown && <div className="text-xs text-slate-600">{breakdown}</div>}
+                {breakdownCharge && <div className="text-xs text-slate-600">{breakdownCharge}</div>}
+
+                {/* Compare: volumetric vs actual */}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-slate-200 bg-white p-2">
+                    <div className="text-slate-500">Based on volumetric weight</div>
+                    <div className="text-sm font-semibold">
+                      {resVol.totalCNY.toFixed(2)} CNY · ${volShippingUSD.toFixed(2)} USD
+                    </div>
+                    {breakdownVol && <div className="mt-1 text-xs text-slate-600">{breakdownVol}</div>}
+                    <div className="mt-1 text-[11px] text-slate-500">Vol: {volKg.toFixed(3)} kg</div>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white p-2">
+                    <div className="text-slate-500">Based on actual weight</div>
+                    <div className="text-sm font-semibold">
+                      {resActual.totalCNY.toFixed(2)} CNY · ${actualShippingUSD.toFixed(2)} USD
+                    </div>
+                    {hasActual ? (
+                      <>
+                        {breakdownActual && <div className="mt-1 text-xs text-slate-600">{breakdownActual}</div>}
+                        <div className="mt-1 text-[11px] text-slate-500">Actual: {actualKg.toFixed(3)} kg</div>
+                      </>
+                    ) : (
+                      <div className="mt-1 text-[11px] text-slate-500">Enter actual weight to see actual‑weight pricing.</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="text-[11px] text-slate-500">
+                  Totals and per‑unit costs use <span className="font-medium">chargeable</span> (max of volumetric vs actual).
+                </div>
+
                 <div className="grid grid-cols-2 gap-3">
                   <div><div className="text-slate-500">Variable fee per unit</div><div className="font-semibold">${variableFeeUSD.toFixed(2)} ({variableFeePct||0}%)</div></div>
                   <div><div className="text-slate-500">Refund fee per unit</div><div className="font-semibold">${refundFeeUSD.toFixed(2)} ({refundFeePct||0}%)</div></div>
@@ -714,6 +774,7 @@ export default function PackagingBoxDesigner() {
 
               <p className="mt-3 text-[11px] leading-relaxed text-slate-500">
                 Notes: Sheet pricing uses fee-per-kg × billed weight (rounded up to 0.001 kg, min 0.03 kg) + item fee per parcel.
+                The compare block shows prices if billed purely on volumetric vs purely on actual. Totals use the higher (chargeable).
                 Confirm surcharges or lane-specific adjustments with your account manager if needed.
               </p>
             </div>
